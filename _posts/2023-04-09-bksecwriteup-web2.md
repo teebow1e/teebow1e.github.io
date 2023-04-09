@@ -103,3 +103,174 @@ BKSEC{p0em_1s_4_g00d_w4y_t0_s4y_ily}
 {: .prompt-info}
 
 ### Phân tích
+Vào trang web chúng ta có 1 form cơ bản:
+![front](/assets/img/2023-04-09-bksecweb2/feedback-front.png)
+Khi submit form, server đã generate ra 1 trang web với những thông tin đã được truyền vào:
+![submitted](/assets/img/2023-04-09-bksecweb2/feedback-sample.png)
+
+Ở thanh navigation bar, chúng ta có 1 endpoint là `Admin Panel`, tuy nhiên bấm vào thì bị lỗi Forbidden.
+
+Bài này có cho chúng ta một file zip chứa mã nguồn, giải nén file ra, và ta có các file:
+```bash
+teebow1e@teebow1e:~/feedback$ tree
+.
+└── Feedback_Form
+    ├── Dockerfile
+    ├── app.py
+    ├── build-docker.sh
+    ├── docker-compose.yml
+    ├── requirements.txt
+    ├── static
+    │   └── feedbacks
+    └── templates
+        ├── errors
+        │   ├── content_error.html
+        │   └── subject_error.html
+        └── index.html
+
+5 directories, 8 files
+```
+Mình có file `app.py`:
+```python
+from werkzeug.urls import url_fix
+from secrets import token_urlsafe
+from flask import Flask, request, abort, render_template, redirect, url_for
+from unidecode import unidecode
+import os, re
+
+app = Flask(__name__)
+app.config['FLAG'] = os.environ['FLAG']
+
+def findWholeWord(w):
+    return re.compile(r'\b({0})\b'.format(w), flags=re.IGNORECASE).search
+
+bad_chars = "'_#&;+"
+bad_cmds = ['import', 'os', 'popen', 'subprocess', 'env', 'print env']
+
+@app.route("/")
+def index():
+    return render_template("index.html", error=request.args.get("error"))
+
+@app.route('/admin', methods=['GET'])
+def admin():
+    return abort(403)
+
+@app.route("/feedback", methods=["POST"])
+def create():
+    username = request.form.get("username", "")
+    subject = request.form.get("subject", "")
+    content = request.form.get("content", "")
+    if len(subject) > 128 or "_" in subject or "/" in subject:
+        return redirect(url_for("index", error="subject_error"))
+    if "_" in content or "." in content or len(content) > 512:
+        return redirect(url_for("index", error="content_error"))
+    if any(char in bad_chars for char in content):
+        return redirect(url_for("index", error="content_error"))
+    for cmd in bad_cmds:
+        if findWholeWord(cmd)(content):
+            return redirect(url_for("index", error="content_error"))
+    name = "static/feedbacks/" + url_fix(unidecode(subject).replace(" ", ""))  + token_urlsafe(16) + ".html"
+    with open(name, "w") as f:
+        feedback = f'''<!DOCTYPE html>
+<html lang="en">
+  <head>
+    << STRIPPED >>
+  </head>
+  <body>
+    << STRIPPED >>
+
+    <div class="container">
+      <div class="text-center mt-5">
+        <h1>From {username}</h1>
+        <p class="lead">{subject}</p>
+      </div>
+      <div class="container">
+        <div class="alert alert-error" role="alert">
+          <p>{content}</p>
+        
+    << STRIPPED >>
+  </body>
+</html>'''
+        f.write(feedback)
+    return redirect(name)
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=os.environ['PORT'])
+```
+
+Qua phân tích code, mình thấy được:
+- Backend của web là Flask, FLAG được lưu ở trong biến môi trường và config của webapp. <br>
+    → Khả năng cao đây là 1 web-app bị dính lỗi SSTI.
+- Các ký tự bị filter: '_#&;+ <br>
+    → làm cho quá trình tìm payload khó khăn hơn
+- Các word bị filter: 'import', 'os', 'popen', 'subprocess', 'env', 'print env' <br>
+    → không cho phép người dùng import các thư viện để tương tác với server → Không có RCE.
+
+- Subject không được chứa dấu _ hoặc dấu /, không được dài quá 128 ký tự.
+- Content không được dài quá 512 ký tự, không được chứa các word/ký tự đặc biệt bị filter, dấu _, dấu chấm.
+
+- Sau đó, username, subject, content được truyền vào template trong biến `feedback` và được lưu vào thư mục `/static/feedbacks`, tên gồm subject (user có thể control được), 16 ký tự ngẫu nhiên và đuôi `.html`
+- Sau khi viết vào file, server sẽ redirect đến trang feedback với thông tin như đã nhập vào.
+
+### Hướng giải
+Như đã đề cập trong phần phân tích, sau khi nhập vào thông tin, user bị *redirect* đến trang đích, nên code sẽ không thể được thực thi. (ở đây mình nhập thử payload vào phần content):
+![ssti1](/assets/img/2023-04-09-bksecweb2/feedback-sstiattempt.png)
+
+Chính vì thế, mình cần phải tìm cách truyền payload vào hàm `render_template`, và trong code có đúng 1 phần có sử dụng hàm này.
+```python
+@app.route("/")
+def index():
+    return render_template("index.html", error=request.args.get("error"))
+```
+
+Bên cạnh đó, trong file HTML cũng có 1 đoạn code khá thú vị:
+{% raw %}
+```html
+    <!-- Page content-->
+    <div class="container">
+      <div class="text-center mt-5">
+        <h1>Feedback form for Watermelon clan</h1>
+        <p class="lead">We hope you have a good time with us!</p>
+      </div>
+    {% if error is not none %}
+    <div class="container">
+      <div class="alert alert-error" role="alert">
+        <p>ERROR: {{ error }}</p>
+        {% include "errors/" + error + ".html" ignore missing %}
+      </div>
+    </div>          
+```
+{% endraw %}
+
+Trong đoạn code này, nếu trang web phát sinh error, web sẽ redirect tới một trang nêu tên lỗi và **render** cả description của lỗi. File description này được lưu ở `/templates/errors`. Vậy mục tiêu sẽ là ghi payload vào trong thư mục này và render qua parameter `error`.
+
+Trong app.py, có một lỗ hổng khi khai báo biến `name`:
+```python
+name = "static/feedbacks/" + url_fix(unidecode(subject).replace(" ", ""))  + token_urlsafe(16) + ".html"
+```
+Trong biến `name` đã bao gồm cả đường dẫn, và user có thể điều khiến được biến subject. Và chúng ta có... Path Traversal.
+
+Payload mình sử dụng cho phần **subject** sẽ là:
+```
+..\..\templates\errors
+```
+
+Phần payload SSTI mình sẽ sử dụng 1 payload bypass được tất cả các điều kiện ở trên:
+{% raw %}
+```
+{{ self|attr("\x5f\x5fdict\x5f\x5f") }}
+```
+{% endraw %}
+
+Và đem đi submit form thôi:
+![submit](/assets/img/2023-04-09-bksecweb2/feedback-submit.png)
+
+Sau khi submit, chúng ta được 1 lỗi `Not Found`, lỗi này là do mình đã Path Traversal thành công.
+![err](/assets/img/2023-04-09-bksecweb2/feedback-error.png)
+
+Lúc này chỉ cần lấy phần tên trước `.html`, và chèn vào `?error=` là ta sẽ có flag.
+![obtain-flag](/assets/img/2023-04-09-bksecweb2/feedback-res.png)
+
+```
+BKSEC{un4bl3_t0_imp0rt_1s_4_pa1n_in_th3_@ss_46dba925}
+```
