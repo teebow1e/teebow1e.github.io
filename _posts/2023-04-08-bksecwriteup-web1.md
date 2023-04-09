@@ -3,6 +3,8 @@ title: BKSec CTF tuyển thành viên 2023 - Writeup mảng Web
 date: 2023-04-08 23:00:00 +0700
 categories: [CTF Write-up]
 tags: [web]
+image:
+    path: /assets/banner.png
 ---
 
 ## Echo echo ech000
